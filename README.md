@@ -1,9 +1,6 @@
 # NL2SPARQL
-<img width="882" height="373" alt="image" src="https://github.com/user-attachments/assets/a9ee9c48-e39a-497a-9d79-1828c5b85563" />
 
-
-
-## Run
+## Setup
 ```bash
 python -m venv .venv
 source .venv/bin/activate
@@ -15,7 +12,7 @@ Create `.env` with:
 GROQ_API_KEY=your_key_here
 ```
 
-Start:
+## CLI
 ```bash
 ./run.sh
 ```
@@ -23,4 +20,9 @@ Start:
 Alternative:
 ```bash
 python main.py
+```
+
+## Chat (Streamlit)
+```bash
+streamlit run app.py
 ```
