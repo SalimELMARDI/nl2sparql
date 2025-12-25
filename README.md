@@ -1,4 +1,7 @@
 # NL2SPARQL
+<img width="882" height="373" alt="image" src="https://github.com/user-attachments/assets/a9ee9c48-e39a-497a-9d79-1828c5b85563" />
+
+
 
 ## Run
 ```bash
