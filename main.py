@@ -1,255 +1,171 @@
-"""Command-line entry point for the NL2SPARQL pipeline.
-
-The loop wires together entity linking, schema retrieval, LLM generation,
-and SPARQL execution to provide an end-to-end RAG workflow.
-"""
 from __future__ import annotations
 
-import os
-import sys
 import argparse
-from typing import Any, Dict, List
-from urllib.parse import urlparse
+import os
+from typing import Dict, List, Optional
 
-from src.config import load_config
+from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.status import Status
+from rich.syntax import Syntax
+from rich.table import Table
+from rich.text import Text
+
+from src.config import Config, load_config
 from src.executor import execute_query
 from src.generator import SparqlGenerator
 from src.linker import link_entities
 from src.schema_store import SchemaStore
 
-LOGO_TEXT = "NL2SPARQL"
-LOGO_HEIGHT = 5
-LETTER_ART = {
-    "N": ["#   #", "##  #", "# # #", "#  ##", "#   #"],
-    "L": ["#    ", "#    ", "#    ", "#    ", "#####"],
-    "2": ["#####", "    #", "#####", "#    ", "#####"],
-    "S": ["#####", "#    ", "#####", "    #", "#####"],
-    "P": ["#### ", "#   #", "#### ", "#    ", "#    "],
-    "A": [" ### ", "#   #", "#####", "#   #", "#   #"],
-    "R": ["#### ", "#   #", "#### ", "#  # ", "#   #"],
-    "Q": [" ### ", "#   #", "#   #", "#  ##", " ####"],
-    " ": ["     ", "     ", "     ", "     ", "     "],
-}
-
-USE_COLOR = sys.stdout.isatty() and os.getenv("NO_COLOR") is None
-SHOW_BANNER = os.getenv("NL2SPARQL_NO_BANNER") is None
-ACCENT = "36"
-DIM = "90"
+BANNER = r"""
+ _   _ _     ____  ____   ____  ____   ___   ____  _     
+| \ | | |   / ___||  _ \ / ___||  _ \ / _ \ / ___|| |    
+|  \| | |   \___ \| |_) | |  _ | |_) | | | | |  _ | |    
+| |\  | |___ ___) |  __/| |_| ||  _ <| |_| | |_| || |___ 
+|_| \_|_____|____/|_|    \____||_| \_\\___/ \____||_____|
+"""
 
 
-def style(text: str, code: str) -> str:
-    if not USE_COLOR:
-        return text
-    return f"\033[{code}m{text}\033[0m"
+def render_banner(console: Console) -> None:
+    logo = Text(BANNER.strip("\n"), style="bold cyan")
+    panel = Panel.fit(logo, border_style="blue", title="NL2SPARQL")
+    console.print(panel)
 
 
-def accent(text: str) -> str:
-    return style(text, f"1;{ACCENT}")
+def _stringify_binding(binding: Dict[str, Any]) -> str:
+    value = binding.get("value", "")
+    lang = binding.get("xml:lang") or binding.get("lang")
+    datatype = binding.get("datatype")
+    if lang:
+        return f"{value} (@{lang})"
+    if datatype:
+        short_type = datatype.rsplit("#", 1)[-1]
+        return f"{value} ({short_type})"
+    return str(value)
 
 
-def dim(text: str) -> str:
-    return style(text, DIM)
+def build_results_table(results: Dict[str, Any]) -> Table:
+    if "boolean" in results:
+        table = Table(title="Results", box=box.SIMPLE_HEAVY)
+        table.add_column("ASK")
+        table.add_row("true" if results.get("boolean") else "false")
+        return table
 
-
-def gradient(text: str, codes: List[str]) -> str:
-    if not USE_COLOR:
-        return text
-    rendered: List[str] = []
-    idx = 0
-    for ch in text:
-        if ch == " ":
-            rendered.append(ch)
-            continue
-        code = codes[idx % len(codes)]
-        rendered.append(f"\033[{code}m{ch}\033[0m")
-        idx += 1
-    return "".join(rendered)
-
-
-def render_logo(text: str) -> List[str]:
-    rows = [""] * LOGO_HEIGHT
-    for ch in text:
-        art = LETTER_ART.get(ch.upper(), LETTER_ART[" "])
-        for idx in range(LOGO_HEIGHT):
-            rows[idx] += art[idx] + "  "
-    return [row.rstrip() for row in rows]
-
-
-def render_banner(config: Any) -> None:
-    logo_lines = render_logo(LOGO_TEXT)
-    gradient_codes = ["34", "35", "36", "94", "95", "96"]
-    host = urlparse(config.dbpedia_sparql_endpoint).netloc or config.dbpedia_sparql_endpoint
-    tips = [
-        "Ask in natural language; mention entities by name.",
-        "Add constraints (time, place, type) for precision.",
-        "Type 'exit' or 'quit' to stop.",
-    ]
-    subtitle = "DBpedia SPARQL console online"
-    status = (
-        f"Model: {config.groq_model} | Endpoint: {host} | Timeout: {config.request_timeout_sec}s"
-    )
-    width = max(
-        max(len(line) for line in logo_lines),
-        len(subtitle),
-        len(status),
-        len("Tips for getting started:"),
-    )
-    rule = dim("-" * width)
-
-    print(rule)
-    for line in logo_lines:
-        print(gradient(line, gradient_codes))
-    print(accent(subtitle))
-    print()
-    print(style("Tips for getting started:", "1"))
-    for idx, tip in enumerate(tips, start=1):
-        print(f"  {idx}. {tip}")
-    print()
-    print(dim(status))
-    print(rule)
-
-
-def print_stage(title: str) -> None:
-    print(f"\n{accent(f'// {title}')}")
-
-
-def format_entities(entities: List[Dict[str, str]]) -> str:
-    if not entities:
-        return "(none)"
-    lines = []
-    for ent in entities:
-        types = ent.get("types", "")
-        type_hint = f" | types={types}" if types else ""
-        score = ent.get("similarity_score")
-        support = ent.get("support")
-        score_hint = ""
-        if score is not None or support is not None:
-            score_value = f"{float(score):.2f}" if score is not None else "n/a"
-            support_value = f"{support}" if support is not None else "n/a"
-            score_hint = f" | score={score_value} | support={support_value}"
-        lines.append(
-            f"- {ent.get('surface_form', '')} -> {ent.get('uri', '')}{type_hint}{score_hint}"
-        )
-    return "\n".join(lines)
-
-
-def format_properties(properties: List[Dict[str, str]]) -> str:
-    if not properties:
-        return "(none)"
-    lines = []
-    for prop in properties:
-        lines.append(
-            f"- {prop.get('label', '')} -> {prop.get('prefixed', prop.get('uri', ''))}"
-        )
-    return "\n".join(lines)
-
-
-def format_classes(classes: List[Dict[str, str]]) -> str:
-    if not classes:
-        return "(none)"
-    lines = []
-    for cls in classes:
-        lines.append(f"- {cls.get('label', '')} -> {cls.get('prefixed', cls.get('uri', ''))}")
-    return "\n".join(lines)
-
-
-def print_results(data: Dict[str, Any], max_rows: int = 10) -> None:
-    if "boolean" in data:
-        print(f"ASK result: {data.get('boolean')}")
-        return
-
-    head = data.get("head", {})
+    head = results.get("head", {})
     vars_ = head.get("vars", [])
-    bindings = data.get("results", {}).get("bindings", [])
-
+    bindings = results.get("results", {}).get("bindings", [])
+    table = Table(title="Results", box=box.SIMPLE_HEAVY, show_lines=False)
     if not vars_:
-        print("No variables returned.")
-        return
+        table.add_column("Message")
+        table.add_row("No results.")
+        return table
 
-    print(f"Columns: {', '.join(vars_)}")
+    for var in vars_:
+        table.add_column(var, overflow="fold")
+
     if not bindings:
-        print("No results.")
-        return
+        table.add_row(*(["No results."] * len(vars_)))
+        return table
 
-    for idx, row in enumerate(bindings[:max_rows], start=1):
-        rendered = []
-        for var in vars_:
-            value = row.get(var, {}).get("value", "")
-            rendered.append(f"{var}={value}")
-        print(f"  {idx:>2}. " + " | ".join(rendered))
-
-    if len(bindings) > max_rows:
-        print(f"... ({len(bindings) - max_rows} more rows)")
+    for row in bindings:
+        table.add_row(*[_stringify_binding(row.get(var, {})) for var in vars_])
+    return table
 
 
-def process_question(
+def run_pipeline(
     question: str,
-    config: Any,
+    console: Console,
+    config: Config,
     schema_store: SchemaStore,
     generator: SparqlGenerator,
-    verbose: bool = False,
 ) -> None:
-    entities = link_entities(question, config)
-    classes = schema_store.retrieve_classes(question)
-    properties = schema_store.retrieve(question, entities)
-    query = generator.generate(question, entities, properties, classes)
+    execution_error: Optional[str] = None
+    results: Optional[Dict[str, Any]] = None
 
-    if verbose:
-        print("\nLinked entities:")
-        print(format_entities(entities))
-        print("\nRetrieved classes:")
-        print(format_classes(classes))
-        print("\nRetrieved properties:")
-        print(format_properties(properties))
+    with console.status("[bold green]Thinking...", spinner="dots") as status:
+        status: Status
+        status.update("Step 1/4: Scanning user question for entities...")
+        entities = link_entities(question, config)
 
-    print("\nGenerated SPARQL:")
-    print(query)
+        status.update(
+            f"Step 2/4: Mapping schema constraints (found {len(entities)} entities)..."
+        )
+        classes = schema_store.retrieve_classes(question)
+        properties = schema_store.retrieve(question, entities=entities)
 
-    try:
-        results = execute_query(query, config)
-        print("\nResults:")
-        print_results(results)
-    except Exception as exc:
-        print(f"Execution error: {exc}")
+        status.update("Step 3/4: Drafting SPARQL query...")
+        query = generator.generate(question, entities, properties, classes)
+
+        status.update("Step 4/4: Executing query...")
+        try:
+            results = execute_query(query, config)
+        except Exception as exc:
+            execution_error = str(exc)
+
+    console.print()
+    console.print("[bold]SPARQL Query[/bold]")
+    console.print(Syntax(query, "sparql", theme="monokai", line_numbers=True))
+
+    if execution_error:
+        console.print(
+            Panel(
+                execution_error,
+                border_style="red",
+                title="Execution Error",
+            )
+        )
+        return
+
+    if results is None:
+        console.print(Panel("No results returned.", border_style="red", title="Error"))
+        return
+
+    console.print(build_results_table(results))
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="NL2SPARQL for DBpedia")
-    parser.add_argument("--question", "-q", help="Run a single query and exit")
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Show linking and schema retrieval details",
-    )
+    console = Console()
+    parser = argparse.ArgumentParser(description="NL2SPARQL CLI")
+    parser.add_argument("-q", "--question", help="Run a single question and exit.")
     args = parser.parse_args()
 
-    config = load_config()
+    try:
+        config = load_config()
+    except ValueError as exc:
+        console.print(f"[bold red]Configuration error:[/] {exc}")
+        raise SystemExit(1)
+
     schema_store = SchemaStore(config)
     generator = SparqlGenerator(config)
 
-    verbose = args.verbose or os.getenv("NL2SPARQL_VERBOSE") == "1"
-
-    if args.question is not None:
+    banner_enabled = not os.getenv("NL2SPARQL_NO_BANNER")
+    if args.question:
+        if banner_enabled:
+            render_banner(console)
         question = args.question.strip()
         if question:
-            process_question(question, config, schema_store, generator, verbose=verbose)
+            run_pipeline(question, console, config, schema_store, generator)
         return
 
-    if SHOW_BANNER:
-        render_banner(config)
+    if banner_enabled:
+        render_banner(console)
+    console.print("[dim]Ask a question about DBpedia (type 'exit' to quit).[/dim]")
+
     while True:
         try:
-            prompt = accent(">>") + " "
-            question = input(f"\n{prompt}").strip()
-        except EOFError:
+            question = console.input("[bold cyan]>> [/]").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[dim]Goodbye.[/dim]")
             break
 
         if not question:
             continue
         if question.lower() in {"exit", "quit"}:
+            console.print("[dim]Goodbye.[/dim]")
             break
 
-        process_question(question, config, schema_store, generator, verbose=verbose)
+        run_pipeline(question, console, config, schema_store, generator)
 
 
 if __name__ == "__main__":

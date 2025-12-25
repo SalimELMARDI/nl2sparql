@@ -4,3 +4,4 @@ groq
 sentence-transformers
 chromadb
 SPARQLWrapper
+rich
